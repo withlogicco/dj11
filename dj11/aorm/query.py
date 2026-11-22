@@ -6,8 +6,10 @@ database. Shapes the native path cannot yet run fail with
 `NotSupportedError` before any database I/O.
 """
 
-from collections.abc import AsyncIterator
+import operator
+from collections.abc import AsyncIterator, Callable
 from typing import Any
+from weakref import ref as weak_ref
 
 from django.db.models import Count, QuerySet
 from django.db.models.constants import OnConflict
@@ -16,6 +18,8 @@ from django.db.models.query import (
     NamedValuesListIterable,
     ValuesIterable,
     ValuesListIterable,
+    _get_from_db,
+    get_related_populators,
 )
 from django.db.models.sql import constants as sql_constants
 from django.db.models.sql.subqueries import DeleteQuery, InsertQuery, UpdateQuery
@@ -33,41 +37,41 @@ class AsyncQuerySet(QuerySet):
         rows = await compiler.aexecute_sql(chunk_size=chunk_size)
         fields = [item[0] for item in compiler.select[: compiler.col_count]]
         converters = compiler.get_converters(fields)
+        materialize = self._materializer(compiler)
         iterator = rows.__aiter__()
         try:
             async for chunk in iterator:
                 chunk = convert(chunk, converters, compiler.connection)
                 for row in chunk:
-                    yield self._materialize(row, compiler)
+                    yield materialize(row)
         finally:
             await iterator.aclose()
             await close_rows(rows)
 
     def _check_supported(self) -> None:
-        if self._prefetch_related_lookups or self.query.select_related:
-            raise NotSupportedError("related loading is not supported natively")
-        if any(
-            count and alias != self.query.base_table
-            for alias, count in self.query.alias_refcount.items()
-        ):
-            raise NotSupportedError("joins are not supported natively")
-        if self.query.deferred_loading[0]:
-            raise NotSupportedError("deferred loading is not supported natively")
+        if self._prefetch_related_lookups:
+            # Prefetching runs more queries through Django's sync machinery.
+            raise NotSupportedError("prefetch_related is not supported natively")
         if self.query.select_for_update:
             raise NotSupportedError("select_for_update is not supported natively")
 
-    def _materialize(self, row: list[Any], compiler: Any) -> Any:
+    def _materializer(self, compiler: Any) -> Callable[[list[Any]], Any]:
+        """How each row of this query becomes what iterating it yields.
+
+        It needs the compiler after it ran: only then does it know which
+        columns belong to which model.
+        """
         match self._iterable_class:
             case type() as cls if issubclass(cls, ValuesIterable):
-                return _values(self, row)
+                return lambda row: _values(self, row)
             case type() as cls if issubclass(cls, FlatValuesListIterable):
-                return row[0]
+                return operator.itemgetter(0)
             case type() as cls if issubclass(
                 cls, (ValuesListIterable, NamedValuesListIterable)
             ):
-                return tuple(row)
+                return tuple
             case _:
-                return _model(self, row, compiler)
+                return _Models(self, compiler)
 
     def __aiter__(self) -> AsyncIterator[Any]:
         return self._aiter()
@@ -201,12 +205,68 @@ def _values(queryset: AsyncQuerySet, row: list[Any]) -> dict[str, Any]:
     return dict(zip(names, row, strict=False))
 
 
-def _model(queryset: AsyncQuerySet, row: list[Any], compiler: Any) -> Any:
-    klass_info = compiler.klass_info
-    fields = [
-        field[0].target.attname for field in compiler.select[: compiler.col_count]
-    ]
-    return klass_info["model"].from_db(queryset.db, fields, row)
+class _Models:
+    """Build model instances from rows as Django's `ModelIterable` does.
+
+    The same steps in the same order, none of which touches the database:
+    the model's own columns, the objects `select_related` joined in,
+    annotations, and the related objects a related manager already holds.
+    """
+
+    def __init__(self, queryset: AsyncQuerySet, compiler: Any) -> None:
+        select, klass_info = compiler.select, compiler.klass_info
+        columns = klass_info["select_fields"]
+        self.start, self.end = columns[0], columns[-1] + 1
+        self.names = [
+            column[0].target.attname for column in select[self.start : self.end]
+        ]
+        self.db = queryset.db
+        self.fetch_mode = queryset._fetch_mode
+        self.from_db = _get_from_db(klass_info["model"], self.fetch_mode)
+        self.related = get_related_populators(
+            klass_info, select, self.db, self.fetch_mode
+        )
+        self.annotations = compiler.annotation_col_map or {}
+        self.known = _known_related(queryset)
+        self.peers: list[Any] = []
+
+    def __call__(self, row: list[Any]) -> Any:
+        obj = self.from_db(self.db, self.names, row[self.start : self.end])
+        if self.fetch_mode.track_peers:
+            self.peers.append(weak_ref(obj))
+            obj._state.peers = self.peers
+        for populator in self.related:
+            populator.populate(row, obj)
+        for name, position in self.annotations.items():
+            setattr(obj, name, row[position])
+        for field, objs, attnames, key in self.known:
+            _attach_known(obj, field, objs, attnames, key)
+        return obj
+
+
+def _known_related(queryset: AsyncQuerySet) -> list[tuple[Any, Any, list[str], Any]]:
+    known = []
+    for field, objs in queryset._known_related_objects.items():
+        attnames = [
+            field.attname
+            if name == "self"
+            else queryset.model._meta.get_field(name).attname
+            for name in field.from_fields
+        ]
+        known.append((field, objs, attnames, operator.attrgetter(*attnames)))
+    return known
+
+
+def _attach_known(
+    obj: Any, field: Any, objs: Any, attnames: list[str], key: Any
+) -> None:
+    # Keep what select_related loaded, and never read a deferred column:
+    # that would be a query.
+    if field.is_cached(obj) or any(name not in obj.__dict__ for name in attnames):
+        return
+    related = objs.get(key(obj))
+    if related is not None:
+        setattr(obj, field.name, related)
 
 
 async def _insert(

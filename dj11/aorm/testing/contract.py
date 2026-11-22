@@ -13,10 +13,20 @@ from typing import Any
 from unittest import mock
 
 from django.db import connections, models
-from django.db.models import Count, Max, Sum
+from django.db.models import Count, F, Max, Sum
 
 from dj11.aorm.exceptions import NotSupportedError
 from dj11.aorm.manager import AsyncManager
+
+
+class Shelf(models.Model):
+    name = models.CharField(max_length=32)
+
+    objects = AsyncManager()
+
+    class Meta:
+        app_label = "aorm_contract"
+        db_table = "aorm_contract_shelf"
 
 
 class Item(models.Model):
@@ -24,6 +34,7 @@ class Item(models.Model):
     rank = models.IntegerField()
     weight = models.FloatField(null=True)
     active = models.BooleanField(default=True)
+    shelf = models.ForeignKey(Shelf, models.SET_NULL, null=True)
 
     objects = AsyncManager()
 
@@ -62,6 +73,7 @@ class AsyncORMContract:
         super().setUp()
         connection = self.schema_connection()
         with connection.schema_editor() as editor:
+            editor.create_model(Shelf)
             editor.create_model(Item)
         connection.close()
         self.cursors: list[Tracked] = []
@@ -77,6 +89,7 @@ class AsyncORMContract:
         connection = self.schema_connection()
         with connection.schema_editor() as editor:
             editor.delete_model(Item)
+            editor.delete_model(Shelf)
         connection.close()
         super().tearDown()
 
@@ -117,6 +130,14 @@ class AsyncORMContract:
 
     async def seed(self) -> list[Item]:
         return await self.items().abulk_create(_rows())
+
+    async def shelve(self) -> tuple[Shelf, Shelf]:
+        """Seed the items, with "a" and "b" on the top shelf, "c" on none."""
+        shelves = Shelf.objects.using(self.alias)
+        top, low = await shelves.abulk_create([Shelf(name="top"), Shelf(name="low")])
+        a, b, _ = await self.seed()
+        await self.items().filter(pk__in=[a.pk, b.pk]).aupdate(shelf=top)
+        return top, low
 
     async def test_streams_model_rows_in_order(self) -> None:
         await self.seed()
@@ -224,6 +245,49 @@ class AsyncORMContract:
         self.assertEqual(len(self.cursors), 3)
         self.assertTrue(all(cursor.closed for cursor in self.cursors))
 
+    async def test_select_related_loads_the_related_row_in_one_query(self) -> None:
+        await self.shelve()
+        rows = self.items().select_related("shelf").order_by("rank")
+        items = [item async for item in rows]
+        opened = len(self.cursors)
+        names = [item.shelf.name if item.shelf else None for item in items]
+        self.assertEqual(names, ["top", "top", None])
+        # Reading a related object select_related did not load would query.
+        self.assertEqual(len(self.cursors), opened)
+
+    async def test_filters_values_and_counts_across_a_join(self) -> None:
+        await self.shelve()
+        on_top = self.items().filter(shelf__name="top").order_by("rank")
+        self.assertEqual([item.name async for item in on_top], ["a", "b"])
+        pairs = self.items().order_by("rank").values_list("name", "shelf__name")
+        self.assertEqual(
+            [pair async for pair in pairs], [("a", "top"), ("b", "top"), ("c", None)]
+        )
+        self.assertEqual(await on_top.acount(), 2)
+        self.assertEqual(await on_top.aaggregate(Max("rank")), {"rank__max": 2})
+
+    async def test_only_and_defer_leave_the_rest_unloaded(self) -> None:
+        await self.seed()
+        only = await self.items().only("name").aget(name="a")
+        self.assertEqual(only.name, "a")
+        self.assertEqual(
+            only.get_deferred_fields(), {"shelf_id", "rank", "weight", "active"}
+        )
+        deferred = await self.items().defer("weight").aget(name="c")
+        self.assertEqual((deferred.name, deferred.rank), ("c", 3))
+        self.assertEqual(deferred.get_deferred_fields(), {"weight"})
+
+    async def test_annotations_land_on_model_rows(self) -> None:
+        await self.seed()
+        rows = self.items().annotate(double=F("rank") * 2).order_by("rank")
+        self.assertEqual([item.double async for item in rows], [2, 4, 6])
+
+    async def test_a_related_manager_attaches_the_object_it_came_from(self) -> None:
+        top, _ = await self.shelve()
+        items = [item async for item in top.item_set.using(self.alias).order_by("rank")]
+        self.assertEqual([item.name for item in items], ["a", "b"])
+        self.assertTrue(all(item.shelf is top for item in items))
+
     async def test_unsupported_shapes_fail_before_io(self) -> None:
         for items in (
             self.items().select_for_update(),
@@ -247,4 +311,4 @@ class AsyncORMContract:
         self.assertEqual(set(self.threads), {threading.get_ident()})
 
 
-__all__ = ["AsyncORMContract", "Item", "Tracked"]
+__all__ = ["AsyncORMContract", "Item", "Shelf", "Tracked"]

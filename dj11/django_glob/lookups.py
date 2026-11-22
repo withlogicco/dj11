@@ -12,6 +12,7 @@ class Glob(Lookup):
     def as_sql(self, compiler, connection):
         return _as_sql(self, compiler, connection, case_sensitive=True)
 
+
 # Case insensitive
 class IGlob(Lookup):
     lookup_name = "iglob"

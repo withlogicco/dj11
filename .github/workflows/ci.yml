@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+# A newer run on the same pull request cancels the older one. Runs on main
+# never cancel each other.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: astral-sh/setup-uv@v10.4.0
+        with:
+          enable-cache: true
+      - run: uv sync --locked
+      - run: uv run ruff check
+      - run: uv run ruff format --check
+      - run: uv run python -m unittest discover -s tests -t .
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: astral-sh/setup-uv@v10.4.0
+      - run: uv build
